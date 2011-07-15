@@ -533,6 +533,15 @@ static VALUE method_zerror(VALUE self, VALUE errc) {
   return rb_str_new2(zerror(FIX2INT(errc)));
 }
 
+static VALUE method_add_auth(VALUE self, VALUE scheme, VALUE cert)
+{
+  Check_Type(scheme, T_STRING);
+  Check_Type(cert, T_STRING);
+  FETCH_DATA_PTR(self, zk);
+
+  return INT2NUM(zoo_add_auth(zk->zh, RSTRING_PTR(scheme), RSTRING_PTR(cert), RSTRING_LEN(cert), 0, 0));
+}
+
 static void zkrb_define_methods(void) {
 #define DEFINE_METHOD(method, args) { \
     rb_define_method(Zookeeper, #method, method_ ## method, args); }
@@ -555,7 +564,7 @@ static void zkrb_define_methods(void) {
   DEFINE_METHOD(recv_timeout, 1);
   DEFINE_METHOD(state, 0);
   // TODO
-  // DEFINE_METHOD(add_auth, 3);
+  DEFINE_METHOD(add_auth, 2);
   // DEFINE_METHOD(async, 1);
 
   // methods for the ruby-side event manager
