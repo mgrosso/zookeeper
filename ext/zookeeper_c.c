@@ -72,6 +72,10 @@ static void print_zkrb_instance_data(struct zkrb_instance_data* ptr) {
 static VALUE method_init(int argc, VALUE* argv, VALUE self) {
   VALUE hostPort;
   VALUE options;
+  VALUE log_level;
+  VALUE data;
+  struct zkrb_instance_data *zk_local_ctx;
+  zkrb_calling_context *ctx;
   rb_scan_args(argc, argv, "11", &hostPort, &options);
 
   if (NIL_P(options)) {
@@ -83,7 +87,7 @@ static VALUE method_init(int argc, VALUE* argv, VALUE self) {
   Check_Type(hostPort, T_STRING);
 
   // Look up :zkc_log_level
-  VALUE log_level = rb_hash_aref(options, ID2SYM(rb_intern("zkc_log_level")));
+  log_level = rb_hash_aref(options, ID2SYM(rb_intern("zkc_log_level")));
   if (NIL_P(log_level)) {
     zoo_set_debug_level(0); // no log messages
   } else {
@@ -92,8 +96,6 @@ static VALUE method_init(int argc, VALUE* argv, VALUE self) {
   }
 
 
-  VALUE data;
-  struct zkrb_instance_data *zk_local_ctx;
   data = Data_Make_Struct(Zookeeper,
            struct zkrb_instance_data,
            0,
@@ -103,8 +105,7 @@ static VALUE method_init(int argc, VALUE* argv, VALUE self) {
 
   zoo_deterministic_conn_order(0);
 
-  zkrb_calling_context *ctx =
-    zkrb_calling_context_alloc(ZKRB_GLOBAL_REQ, zk_local_ctx->queue);
+  ctx = zkrb_calling_context_alloc(ZKRB_GLOBAL_REQ, zk_local_ctx->queue);
 
   zk_local_ctx->zh =
       zookeeper_init(
@@ -133,36 +134,39 @@ static VALUE method_init(int argc, VALUE* argv, VALUE self) {
     rb_raise(rb_eRuntimeError, "zookeeper handle is closed")
 
 #define STANDARD_PREAMBLE(self, zk, reqid, path, async, watch, cb_ctx, w_ctx, call_type) \
+  struct zkrb_instance_data * zk;                                       \
+  zkrb_calling_context* cb_ctx ;                                        \
+  zkrb_calling_context* w_ctx ;                                         \
+  int a, w ;                                                            \
+  zkrb_call_type call_type;                                             \
   if (TYPE(reqid) != T_FIXNUM && TYPE(reqid) != T_BIGNUM) {             \
     rb_raise(rb_eTypeError, "reqid must be Fixnum/Bignum");             \
     return Qnil;                                                        \
   }                                                                     \
   Check_Type(path, T_STRING);                                           \
-  struct zkrb_instance_data * zk;                                       \
   Data_Get_Struct(rb_iv_get(self, "@data"), struct zkrb_instance_data, zk); \
   if (!zk->zh)                                                          \
     rb_raise(rb_eRuntimeError, "zookeeper handle is closed");           \
-  zkrb_calling_context* cb_ctx =                                        \
+  cb_ctx =                                                              \
     (async != Qfalse && async != Qnil) ?                                \
        zkrb_calling_context_alloc(NUM2LL(reqid), zk->queue) :           \
        NULL;                                                            \
-  zkrb_calling_context* w_ctx =                                         \
+  w_ctx =                                                               \
     (watch != Qfalse && watch != Qnil) ?                                \
        zkrb_calling_context_alloc(NUM2LL(reqid), zk->queue) :           \
        NULL;                                                            \
-  int a  = (async != Qfalse && async != Qnil);                          \
-  int w  = (watch != Qfalse && watch != Qnil);                          \
-  zkrb_call_type call_type;                                             \
+  a  = (async != Qfalse && async != Qnil);                              \
+  w  = (watch != Qfalse && watch != Qnil);                              \
   if (a) { if (w) { call_type = ASYNC_WATCH; } else { call_type = ASYNC; } } \
     else { if (w) { call_type =  SYNC_WATCH; } else { call_type = SYNC; } }
 
 static VALUE method_get_children(VALUE self, VALUE reqid, VALUE path, VALUE async, VALUE watch) {
-  STANDARD_PREAMBLE(self, zk, reqid, path, async, watch, data_ctx, watch_ctx, call_type);
-
   struct String_vector strings;
   struct Stat stat;
-
   int rc;
+  VALUE output;
+  STANDARD_PREAMBLE(self, zk, reqid, path, async, watch, data_ctx, watch_ctx, call_type);
+
   switch (call_type) {
     case SYNC:
       rc = zoo_get_children2(zk->zh, RSTRING_PTR(path), 0, &strings, &stat);
@@ -181,7 +185,7 @@ static VALUE method_get_children(VALUE self, VALUE reqid, VALUE path, VALUE asyn
       break;
   }
 
-  VALUE output = rb_ary_new();
+  output = rb_ary_new();
   rb_ary_push(output, INT2FIX(rc));
   if (IS_SYNC(call_type) && rc == ZOK) {
     rb_ary_push(output, zkrb_string_vector_to_ruby(&strings));
@@ -191,11 +195,11 @@ static VALUE method_get_children(VALUE self, VALUE reqid, VALUE path, VALUE asyn
 }
 
 static VALUE method_exists(VALUE self, VALUE reqid, VALUE path, VALUE async, VALUE watch) {
+  struct Stat stat;
+  int rc;
+  VALUE output;
   STANDARD_PREAMBLE(self, zk, reqid, path, async, watch, data_ctx, watch_ctx, call_type);
 
-  struct Stat stat;
-
-  int rc;
   switch (call_type) {
     case SYNC:
       rc = zoo_exists(zk->zh, RSTRING_PTR(path), 0, &stat);
@@ -214,7 +218,7 @@ static VALUE method_exists(VALUE self, VALUE reqid, VALUE path, VALUE async, VAL
       break;
   }
 
-  VALUE output = rb_ary_new();
+  output = rb_ary_new();
   rb_ary_push(output, INT2FIX(rc));
   if (IS_SYNC(call_type) && rc == ZOK) {
     rb_ary_push(output, zkrb_stat_to_rarray(&stat));
@@ -224,18 +228,21 @@ static VALUE method_exists(VALUE self, VALUE reqid, VALUE path, VALUE async, VAL
 
 static VALUE method_create(VALUE self, VALUE reqid, VALUE path, VALUE data, VALUE async, VALUE acls, VALUE flags) {
   VALUE watch = Qfalse;
+  const char *data_ptr ;
+  size_t      data_len ;
+  struct ACL_vector *aclptr = NULL;
+  char realpath[16384];
+  int rc;
+  VALUE output ;
   STANDARD_PREAMBLE(self, zk, reqid, path, async, watch, data_ctx, watch_ctx, call_type);
 
   if (data != Qnil) Check_Type(data, T_STRING);
   Check_Type(flags, T_FIXNUM);
-  const char *data_ptr = (data == Qnil) ? NULL : RSTRING_PTR(data);
-  size_t      data_len = (data == Qnil) ? -1   : RSTRING_LEN(data);
+  data_ptr = (data == Qnil) ? NULL : RSTRING_PTR(data);
+  data_len = (data == Qnil) ? -1   : RSTRING_LEN(data);
 
-  struct ACL_vector *aclptr = NULL;
   if (acls != Qnil) { aclptr = zkrb_ruby_to_aclvector(acls); }
-  char realpath[16384];
 
-  int rc;
   switch (call_type) {
     case SYNC:
       rc = zoo_create(zk->zh, RSTRING_PTR(path), data_ptr, data_len, aclptr, FIX2INT(flags), realpath, sizeof(realpath));
@@ -254,7 +261,7 @@ static VALUE method_create(VALUE self, VALUE reqid, VALUE path, VALUE data, VALU
     free(aclptr);
   }
 
-  VALUE output = rb_ary_new();
+  output = rb_ary_new();
   rb_ary_push(output, INT2FIX(rc));
   if (IS_SYNC(call_type) && rc == ZOK) {
     return rb_ary_push(output, rb_str_new2(realpath));
@@ -264,10 +271,10 @@ static VALUE method_create(VALUE self, VALUE reqid, VALUE path, VALUE data, VALU
 
 static VALUE method_delete(VALUE self, VALUE reqid, VALUE path, VALUE version, VALUE async) {
   VALUE watch = Qfalse;
+  int rc = 0;
   STANDARD_PREAMBLE(self, zk, reqid, path, async, watch, data_ctx, watch_ctx, call_type);
   Check_Type(version, T_FIXNUM);
 
-  int rc = 0;
   switch (call_type) {
     case SYNC:
       rc = zoo_delete(zk->zh, RSTRING_PTR(path), FIX2INT(version));
@@ -287,14 +294,16 @@ static VALUE method_delete(VALUE self, VALUE reqid, VALUE path, VALUE version, V
 #define MAX_ZNODE_SIZE 1048576
 
 static VALUE method_get(VALUE self, VALUE reqid, VALUE path, VALUE async, VALUE watch) {
+  char * data ;
+  int data_len = MAX_ZNODE_SIZE;
+  struct Stat stat;
+  int rc;
+  VALUE output ;
   STANDARD_PREAMBLE(self, zk, reqid, path, async, watch, data_ctx, watch_ctx, call_type);
 
   /* ugh */
-  char * data = malloc(MAX_ZNODE_SIZE);
-  int data_len = MAX_ZNODE_SIZE;
-  struct Stat stat;
+  data = malloc(MAX_ZNODE_SIZE);
 
-  int rc;
 
   switch (call_type) {
     case SYNC:
@@ -314,7 +323,7 @@ static VALUE method_get(VALUE self, VALUE reqid, VALUE path, VALUE async, VALUE 
       break;
   }
 
-  VALUE output = rb_ary_new();
+  output = rb_ary_new();
   rb_ary_push(output, INT2FIX(rc));
   if (IS_SYNC(call_type) && rc == ZOK) {
     if (data_len == -1)
@@ -330,14 +339,17 @@ static VALUE method_get(VALUE self, VALUE reqid, VALUE path, VALUE async, VALUE 
 
 static VALUE method_set(VALUE self, VALUE reqid, VALUE path, VALUE data, VALUE async, VALUE version) {
   VALUE watch = Qfalse;
+  struct Stat stat;
+  const char *data_ptr ;
+  size_t      data_len ;
+  int rc;
+  VALUE output ;
   STANDARD_PREAMBLE(self, zk, reqid, path, async, watch, data_ctx, watch_ctx, call_type);
 
-  struct Stat stat;
   if (data != Qnil) Check_Type(data, T_STRING);
-  const char *data_ptr = (data == Qnil) ? NULL : RSTRING_PTR(data);
-  size_t      data_len = (data == Qnil) ? -1   : RSTRING_LEN(data);
+  data_ptr = (data == Qnil) ? NULL : RSTRING_PTR(data);
+  data_len = (data == Qnil) ? -1   : RSTRING_LEN(data);
 
-  int rc;
   switch (call_type) {
     case SYNC:
       rc = zoo_set2(zk->zh, RSTRING_PTR(path), data_ptr, data_len, FIX2INT(version), &stat);
@@ -352,7 +364,7 @@ static VALUE method_set(VALUE self, VALUE reqid, VALUE path, VALUE data, VALUE a
       break;
   }
 
-  VALUE output = rb_ary_new();
+  output = rb_ary_new();
   rb_ary_push(output, INT2FIX(rc));
   if (IS_SYNC(call_type) && rc == ZOK) {
     rb_ary_push(output, zkrb_stat_to_rarray(&stat));
@@ -362,10 +374,11 @@ static VALUE method_set(VALUE self, VALUE reqid, VALUE path, VALUE data, VALUE a
 
 static VALUE method_set_acl(VALUE self, VALUE reqid, VALUE path, VALUE acls, VALUE async, VALUE version) {
   VALUE watch = Qfalse;
-  STANDARD_PREAMBLE(self, zk, reqid, path, async, watch, data_ctx, watch_ctx, call_type);
-  struct ACL_vector * aclptr = zkrb_ruby_to_aclvector(acls);
-
+  struct ACL_vector * aclptr ;
   int rc;
+  STANDARD_PREAMBLE(self, zk, reqid, path, async, watch, data_ctx, watch_ctx, call_type);
+  aclptr = zkrb_ruby_to_aclvector(acls);
+
   switch (call_type) {
     case SYNC:
       rc = zoo_set_acl(zk->zh, RSTRING_PTR(path), FIX2INT(version), aclptr);
@@ -387,12 +400,12 @@ static VALUE method_set_acl(VALUE self, VALUE reqid, VALUE path, VALUE acls, VAL
 
 static VALUE method_get_acl(VALUE self, VALUE reqid, VALUE path, VALUE async) {
   VALUE watch = Qfalse;
-  STANDARD_PREAMBLE(self, zk, reqid, path, async, watch, data_ctx, watch_ctx, call_type);
-
   struct ACL_vector acls;
   struct Stat stat;
-
   int rc;
+  VALUE output ;
+  STANDARD_PREAMBLE(self, zk, reqid, path, async, watch, data_ctx, watch_ctx, call_type);
+
   switch (call_type) {
     case SYNC:
       rc = zoo_get_acl(zk->zh, RSTRING_PTR(path), &acls, &stat);
@@ -406,7 +419,7 @@ static VALUE method_get_acl(VALUE self, VALUE reqid, VALUE path, VALUE async) {
       break;
   }
 
-  VALUE output = rb_ary_new();
+  output = rb_ary_new();
   rb_ary_push(output, INT2FIX(rc));
   if (IS_SYNC(call_type) && rc == ZOK) {
     rb_ary_push(output, zkrb_acl_vector_to_ruby(&acls));
@@ -423,6 +436,10 @@ static int is_running(VALUE self) {
 
 static VALUE method_get_next_event(VALUE self) {
   char buf[64];
+  zkrb_event_t *event ;
+  int fd;
+  fd_set rset;
+  VALUE hash ;
   FETCH_DATA_PTR(self, zk);
 
   for (;;) {
@@ -435,12 +452,11 @@ static VALUE method_get_next_event(VALUE self) {
       return Qnil;  // this case for shutdown
     }
 
-    zkrb_event_t *event = zkrb_dequeue(zk->queue, 1);
+    event = zkrb_dequeue(zk->queue, 1);
 
     /* Wait for an event using rb_thread_select() on the queue's pipe */
     if (event == NULL) {
-      int fd = zk->queue->pipe_read;
-      fd_set rset;
+      fd = zk->queue->pipe_read;
 
       FD_ZERO(&rset);
       FD_SET(fd, &rset);
@@ -454,7 +470,7 @@ static VALUE method_get_next_event(VALUE self) {
       continue;
     }
 
-    VALUE hash = zkrb_event_to_ruby(event);
+    hash = zkrb_event_to_ruby(event);
     zkrb_event_free(event);
     return hash;
   }
@@ -469,8 +485,9 @@ static VALUE method_has_events(VALUE self) {
 }
 
 static VALUE method_client_id(VALUE self) {
+  const clientid_t *id ;
   FETCH_DATA_PTR(self, zk);
-  const clientid_t *id = zoo_client_id(zk->zh);
+  id = zoo_client_id(zk->zh);
   return UINT2NUM(id->client_id);
 }
 
@@ -494,10 +511,11 @@ static VALUE method_wake_event_loop_bang(VALUE self) {
 // }
 
 static VALUE method_close(VALUE self) {
+  int rc;
   FETCH_DATA_PTR(self, zk);
 
   /* Note that after zookeeper_close() returns, ZK handle is invalid */
-  int rc = destroy_zkrb_instance(zk);
+  rc = destroy_zkrb_instance(zk);
   return INT2FIX(rc);
 }
 
