@@ -553,9 +553,9 @@ static VALUE method_zerror(VALUE self, VALUE errc) {
 
 static VALUE method_add_auth(VALUE self, VALUE scheme, VALUE cert)
 {
+  FETCH_DATA_PTR(self, zk);
   Check_Type(scheme, T_STRING);
   Check_Type(cert, T_STRING);
-  FETCH_DATA_PTR(self, zk);
 
   return INT2NUM(zoo_add_auth(zk->zh, RSTRING_PTR(scheme), RSTRING_PTR(cert), RSTRING_LEN(cert), 0, 0));
 }
